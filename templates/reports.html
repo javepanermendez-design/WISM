@@ -1,0 +1,283 @@
+{% extends 'base.html' %}{% from 'partials/_macros.html' import page_header, status_badge %}{% block title %}Reports & alerts{% endblock %}{% block crumb %}Reports & alerts{% endblock %}{% block content %}{{ page_header('Visibility','Reports & notifications','See the signals behind today’s grocery warehouse decisions.') }}<div class="reports-layout mb-4"><aside class="card-surface section-card report-inbox-panel"><div class="section-title"><div><span class="eyebrow">Inbox</span><h2>Notifications</h2></div><form method="post" action="{{ url_for('mark_notifications') }}"><button class="btn btn-quiet" type="submit">Mark all as read</button></form></div><div class="tabs mb-3"><a class="active" href="#">All</a><a href="#">Unread</a><a href="#">Stock</a><a href="#">Orders</a></div>{% for item in notifications[:8] %}<div class="activity-item"><span class="activity-icon"><i class="bi bi-bell"></i></span><div class="activity-copy"><strong class="{{ 'fw-bold' if item.unread }}">{% if item.unread %}<span class="text-warning">●</span> {% endif %}{{ item.title }}</strong><small>{{ item.body }} · {{ item.created }}</small></div></div>{% endfor %}</aside><section class="card-surface section-card report-panel"><div class="section-title"><div><span class="eyebrow">Reporting</span><h2>Grocery warehouse pulse</h2></div><button id="exportReportBtn" class="btn btn-primary" type="button"><i class="bi bi-download"></i>Export report</button></div><div class="tabs mb-3" id="reportTabs" role="tablist"><a href="{{ url_for('reports', report='inventory') }}" class="{{ 'active' if selected_report == 'inventory' }}" data-report="inventory">Inventory</a><a href="{{ url_for('reports', report='low-stock') }}" class="{{ 'active' if selected_report == 'low-stock' }}" data-report="low-stock">Low stock</a><a href="{{ url_for('reports', report='stock-movement') }}" class="{{ 'active' if selected_report == 'stock-movement' }}" data-report="stock-movement">Stock movement</a><a href="{{ url_for('reports', report='orders') }}" class="{{ 'active' if selected_report == 'orders' }}" data-report="orders">Orders</a></div><div class="row g-2 mb-3" id="summaryTiles"></div><div class="report-chart-shell"><canvas id="reportChart" aria-label="Grocery warehouse report chart"></canvas></div><div id="reportTableContainer" class="d-none"></div><button id="toggleTableBtn" class="btn btn-quiet mt-3" type="button"><i class="bi bi-table"></i><span>View as table</span></button></section></div><section class="card-surface section-card mb-4"><div class="section-title"><div><span class="eyebrow">Order history</span><h2>Completed and cancelled store orders</h2></div><a href="{{ url_for('orders_view', status='Completed') }}">Open order history <i class="bi bi-arrow-right"></i></a></div><table class="table"><thead><tr><th>Order</th><th>Store</th><th>Status</th><th>Date</th></tr></thead><tbody>{% for order in orders if order.status.value in ['Completed','Cancelled'] %}<tr><td><a href="{{ url_for('order_detail', order_id=order.id) }}">{{ order.number }}</a></td><td>{{ order.customer }}</td><td>{{ status_badge(order.status.value) }}</td><td>{{ order.completed_at or order.created }}</td></tr>{% endfor %}</tbody></table></section><section class="card-surface section-card"><div class="section-title"><h2>Low stock watchlist</h2><a href="{{ url_for('inventory', status='low') }}">Open filtered grocery inventory <i class="bi bi-arrow-right"></i></a></div><table class="table"><thead><tr><th>Product</th><th>On hand</th><th>Minimum</th><th>Status</th></tr></thead><tbody>{% for product in products if product.status.value != 'In Stock' %}<tr><td>{{ product.name }} <span class="sku">{{ product.sku }}</span></td><td>{{ product.stock }} {{ product.unit }}</td><td>{{ product.min_stock }} {{ product.unit }}</td><td>{{ status_badge(product.status.value) }}</td></tr>{% endfor %}</tbody></table></section>{% endblock %}{% block scripts %}<script>const reportData = {{ report_data|tojson }};
+const selectedReport = {{ selected_report|tojson }};
+const reportTabs = Array.from(document.querySelectorAll('#reportTabs [data-report]'));
+const summaryTiles = document.getElementById('summaryTiles');
+const reportChart = document.getElementById('reportChart');
+const reportTableContainer = document.getElementById('reportTableContainer');
+const tableToggle = document.getElementById('toggleTableBtn');
+const exportButton = document.getElementById('exportReportBtn');
+let activeChart = null;
+let tableVisible = false;
+let currentSort = { key: null, direction: 'asc' };
+let currentKey = ['inventory', 'low-stock', 'stock-movement', 'orders'].indexOf(selectedReport) >= 0 ? selectedReport : 'inventory';
+const statusIcons = {
+  'in-stock': 'check-circle-fill',
+  'low-stock': 'exclamation-triangle-fill',
+  'out-of-stock': 'x-circle-fill',
+  'pending': 'clock-fill',
+  'picking': 'hand-index-fill',
+  'ready': 'box-seam-fill',
+  'completed': 'check-circle-fill',
+  'cancelled': 'x-circle-fill',
+  'received': 'check-circle-fill',
+  'released': 'arrow-up-right-circle-fill',
+  'transferred': 'arrow-left-right',
+  'adjusted': 'sliders2-vertical'
+};
+
+function getReportConfig(key) {
+  var products = reportData.products || [];
+  var orders = reportData.orders || [];
+  var movements = reportData.movements || [];
+  var inventoryTotals = {};
+  for (var i = 0; i < products.length; i++) {
+    var product = products[i];
+    var label = product.category || 'Other';
+    inventoryTotals[label] = (inventoryTotals[label] || 0) + Number(product.stock);
+  }
+  var lowTotals = {};
+  for (var j = 0; j < products.length; j++) {
+    var product = products[j];
+    if (product.status === 'In Stock') continue;
+    var label = product.category || 'Other';
+    lowTotals[label] = (lowTotals[label] || 0) + 1;
+  }
+  var orderCounts = { Pending: 0, Picking: 0, Ready: 0, Completed: 0, Cancelled: 0 };
+  for (var k = 0; k < orders.length; k++) {
+    var order = orders[k];
+    if (orderCounts[order.status] !== undefined) {
+      orderCounts[order.status] += 1;
+    }
+  }
+  var movementSeries = {};
+  for (var m = 0; m < movements.length; m++) {
+    var movement = movements[m];
+    movementSeries[movement.date] = (movementSeries[movement.date] || 0) + Number(movement.delta);
+  }
+  var movementDates = Object.keys(movementSeries).sort().slice(-7);
+  var reportMap = {
+    inventory: {
+      title: 'Inventory',
+      type: 'bar',
+      labels: Object.keys(inventoryTotals),
+      data: Object.values(inventoryTotals),
+      headers: [
+        { key: 'name', label: 'Product' },
+        { key: 'sku', label: 'SKU' },
+        { key: 'stock', label: 'Stock' },
+        { key: 'status', label: 'Status' }
+      ],
+      rows: products.map(function (product) {
+        return { name: product.name, sku: product.sku, stock: product.stock, status: product.status };
+      })
+    },
+    'low-stock': {
+      title: 'Low stock',
+      type: 'bar',
+      labels: Object.keys(lowTotals),
+      data: Object.values(lowTotals),
+      headers: [
+        { key: 'name', label: 'Product' },
+        { key: 'sku', label: 'SKU' },
+        { key: 'stock', label: 'On hand' },
+        { key: 'status', label: 'Status' }
+      ],
+      rows: products.filter(function (product) { return product.status !== 'In Stock'; }).map(function (product) {
+        return { name: product.name, sku: product.sku, stock: product.stock, status: product.status };
+      })
+    },
+    'stock-movement': {
+      title: 'Stock movement',
+      type: 'line',
+      labels: movementDates,
+      data: movementDates.map(function (date) { return movementSeries[date] || 0; }),
+      headers: [
+        { key: 'reference', label: 'Reference' },
+        { key: 'type', label: 'Type' },
+        { key: 'delta', label: 'Delta' },
+        { key: 'date', label: 'Date' }
+      ],
+      rows: movements.slice().sort(function (left, right) { return new Date(right.date) - new Date(left.date); }).map(function (movement) {
+        return { reference: movement.reference, type: movement.type, delta: movement.delta, date: movement.date };
+      })
+    },
+    orders: {
+      title: 'Orders',
+      type: 'bar',
+      labels: ['Pending', 'Picking', 'Ready', 'Completed', 'Cancelled'],
+      data: ['Pending', 'Picking', 'Ready', 'Completed', 'Cancelled'].map(function (label) { return orderCounts[label] || 0; }),
+      headers: [
+        { key: 'number', label: 'Order' },
+        { key: 'customer', label: 'Customer' },
+        { key: 'status', label: 'Status' },
+        { key: 'progress', label: 'Progress' }
+      ],
+      rows: orders.map(function (order) {
+        return { number: order.number, customer: order.customer, status: order.status, progress: order.progress };
+      })
+    }
+  };
+  return reportMap[key] || reportMap.inventory;
+}
+
+function statusBadge(value) {
+  var normalized = String(value || '').trim().toLowerCase().replace(/\s+/g, '-');
+  var icon = statusIcons[normalized] || 'dot';
+  return '<span class="status status-' + normalized + '"><i class="bi bi-' + icon + '"></i>' + value + '</span>';
+}
+
+function buildSummaryTiles() {
+  var products = reportData.products || [];
+  var orders = reportData.orders || [];
+  var entries = [
+    { label: 'Stock quantity', value: products.reduce(function (sum, product) { return sum + Number(product.stock); }, 0), tone: 'primary', href: '/inventory' },
+    { label: 'Low stock', value: products.filter(function (product) { return product.status === 'Low Stock'; }).length, tone: 'warning', href: '/inventory?status=low' },
+    { label: 'Open orders', value: orders.filter(function (order) { return ['Pending', 'Picking', 'Ready'].indexOf(order.status) >= 0; }).length, tone: 'info', href: '/orders?status=Active' },
+    { label: 'Cancelled', value: orders.filter(function (order) { return order.status === 'Cancelled'; }).length, tone: 'danger', href: '/orders?status=Cancelled' }
+  ];
+  summaryTiles.innerHTML = entries.map(function (entry) {
+    return '<a class="card-surface p-3 d-block report-summary-link report-summary-' + entry.tone + '" href="' + entry.href + '"><small class="text-muted">' + entry.label + '</small><h2 class="mb-0">' + entry.value + '</h2></a>';
+  }).join('');
+}
+
+function updateQuery(reportKey) {
+  var params = new URLSearchParams(window.location.search);
+  params.set('report', reportKey);
+  var nextUrl = window.location.pathname + '?' + params.toString();
+  window.history.replaceState({}, '', nextUrl);
+}
+
+function renderChart(config) {
+  if (activeChart) {
+    activeChart.destroy();
+  }
+  activeChart = new Chart(reportChart, {
+    type: config.type,
+    data: {
+      labels: config.labels,
+      datasets: [{
+        label: config.title,
+        data: config.data,
+        backgroundColor: config.type === 'line' ? 'rgba(29, 87, 165, 0.18)' : '#1D57A5',
+        borderColor: '#1D57A5',
+        borderWidth: 2,
+        borderRadius: 4,
+        fill: config.type === 'line',
+        tension: 0.35
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        y: { beginAtZero: true, grid: { color: '#EDEFF1' } },
+        x: { grid: { display: false } }
+      }
+    }
+  });
+}
+
+function renderTable(config) {
+  var rows = Array.isArray(config.rows) ? config.rows.slice() : [];
+  var searchInput = reportTableContainer.querySelector('[data-report-search]');
+  var searchValue = searchInput ? searchInput.value.trim().toLowerCase() : '';
+  var filteredRows = rows.filter(function (row) {
+    return Object.keys(row).some(function (key) {
+      return String(row[key]).toLowerCase().indexOf(searchValue) >= 0;
+    });
+  });
+  var sortedRows = filteredRows.slice().sort(function (left, right) {
+    if (!currentSort.key) return 0;
+    var leftValue = String(left[currentSort.key] || '').trim();
+    var rightValue = String(right[currentSort.key] || '').trim();
+    var numeric = !isNaN(Number(leftValue)) && !isNaN(Number(rightValue));
+    var comparison = numeric ? Number(leftValue) - Number(rightValue) : leftValue.localeCompare(rightValue);
+    return currentSort.direction === 'asc' ? comparison : -comparison;
+  });
+  var tableHtml = '<div class="report-table-toolbar"><input type="search" class="form-control form-control-sm" data-report-search placeholder="Search report rows..." aria-label="Search report rows" /></div><table class="table report-table"><thead><tr>' + config.headers.map(function (header) {
+    return '<th scope="col" data-sort-key="' + header.key + '" class="' + (currentSort.key === header.key ? 'sorted' : '') + '">' + header.label + '</th>';
+  }).join('') + '</tr></thead><tbody>' + sortedRows.map(function (row) {
+    return '<tr>' + config.headers.map(function (header) {
+      var value = row[header.key];
+      return '<td>' + (header.key === 'status' ? statusBadge(value) : value || '') + '</td>';
+    }).join('') + '</tr>';
+  }).join('') + (sortedRows.length ? '' : '<tr><td colspan="' + config.headers.length + '" class="text-muted">No records match this view.</td></tr>') + '</tbody></table>';
+  reportTableContainer.innerHTML = tableHtml;
+  reportTableContainer.querySelectorAll('[data-sort-key]').forEach(function (th) {
+    th.addEventListener('click', function () {
+      var key = th.dataset.sortKey;
+      if (currentSort.key !== key) {
+        currentSort = { key: key, direction: 'asc' };
+      } else {
+        currentSort.direction = currentSort.direction === 'asc' ? 'desc' : 'asc';
+      }
+      renderTable(getReportConfig(currentKey));
+    });
+  });
+  var searchBox = reportTableContainer.querySelector('[data-report-search]');
+  if (searchBox) {
+    searchBox.addEventListener('input', function () {
+      renderTable(getReportConfig(currentKey));
+    });
+  }
+}
+
+function renderReport(reportKey) {
+  currentKey = ['inventory', 'low-stock', 'stock-movement', 'orders'].indexOf(reportKey) >= 0 ? reportKey : 'inventory';
+  var config = getReportConfig(currentKey);
+  reportTabs.forEach(function (tab) {
+    tab.classList.toggle('active', tab.dataset.report === currentKey);
+  });
+  buildSummaryTiles();
+  renderChart(config);
+  renderTable(config);
+  updateQuery(currentKey);
+}
+
+reportTabs.forEach(function (tab) {
+  tab.addEventListener('click', function (event) {
+    event.preventDefault();
+    renderReport(tab.dataset.report);
+  });
+});
+
+exportButton.addEventListener('click', function () {
+  var config = getReportConfig(currentKey);
+  var headers = config.headers.map(function (column) { return column.label; });
+  var csvRows = [headers.join(',')].concat((config.rows || []).map(function (row) {
+    return headers.map(function (header) {
+      var value = row[header.key] || '';
+      var safe = String(value).replace(/"/g, '""');
+      return '"' + safe + '"';
+    }).join(',');
+  }));
+  var blob = new Blob([csvRows.join('\n')], { type: 'text/csv;charset=utf-8;' });
+  var url = URL.createObjectURL(blob);
+  var link = document.createElement('a');
+  link.href = url;
+  link.download = currentKey + '-' + new Date().toISOString().slice(0, 10) + '.csv';
+  link.click();
+  URL.revokeObjectURL(url);
+  var toast = document.createElement('div');
+  toast.className = 'toast app-toast text-bg-success show';
+  toast.innerHTML = '<i class="bi bi-check-circle-fill"></i><span>' + config.title + ' report exported as CSV.</span>';
+  document.getElementById('toastRegion').appendChild(toast);
+  setTimeout(function () { toast.remove(); }, 2800);
+});
+
+tableToggle.addEventListener('click', function () {
+  tableVisible = !tableVisible;
+  var label = tableVisible ? 'View as chart' : 'View as table';
+  tableToggle.innerHTML = tableVisible ? '<i class="bi bi-bar-chart"></i><span>' + label + '</span>' : '<i class="bi bi-table"></i><span>' + label + '</span>';
+  reportChart.classList.toggle('d-none', tableVisible);
+  reportTableContainer.classList.toggle('d-none', !tableVisible);
+  if (tableVisible) {
+    var searchBox = reportTableContainer.querySelector('[data-report-search]');
+    if (searchBox) {
+      searchBox.focus();
+    }
+  }
+});
+
+renderReport(currentKey);</script>{% endblock %}
