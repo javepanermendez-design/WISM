@@ -102,3 +102,16 @@ def test_dashboard_open_badge_excludes_completed_and_cancelled(client):
     assert app.container.dashboard.navigation_counts()["pending"] == initial - 1
     app.container.orders.complete(3, "Maya Chen")
     assert app.container.dashboard.navigation_counts()["pending"] == initial - 2
+
+
+def test_session_state_persists_between_app_instances(monkeypatch, tmp_path):
+    session_path = tmp_path / "session_state.json"
+    monkeypatch.setenv("WIMS_SESSION_PATH", str(session_path))
+
+    app = create_app()
+    product = app.container.inventory.get(1)
+    product.stock = 42
+    app.container.inventory.save(product)
+
+    restarted = create_app()
+    assert restarted.container.inventory.get(1).stock == 42
